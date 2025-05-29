@@ -3,6 +3,7 @@ const { ethers } = require("hardhat");
 const { time } = require("@nomicfoundation/hardhat-network-helpers");
 
 describe("Escrow", function () {
+  let escrowFactory;
   let escrow;
   let buyer;
   let seller;
@@ -13,9 +14,24 @@ describe("Escrow", function () {
   beforeEach(async function () {
     [buyer, seller, otherAccount] = await ethers.getSigners();
     
+    // Deploy factory first
+    const EscrowFactory = await ethers.getContractFactory("EscrowFactory");
+    escrowFactory = await EscrowFactory.deploy();
+    await escrowFactory.waitForDeployment();
+
+    // Create new escrow through factory
+    const tx = await escrowFactory.createEscrow(seller.address, TIMEOUT_DURATION);
+    const receipt = await tx.wait();
+    
+    // Get escrow address from event
+    const event = receipt.logs.find(
+      log => log.fragment && log.fragment.name === 'EscrowCreated'
+    );
+    const escrowAddress = event.args.escrowAddress;
+
+    // Get Escrow contract instance
     const Escrow = await ethers.getContractFactory("Escrow");
-    escrow = await Escrow.deploy(seller.address, TIMEOUT_DURATION);
-    await escrow.waitForDeployment();
+    escrow = Escrow.attach(escrowAddress);
   });
 
   describe("Deployment", function () {

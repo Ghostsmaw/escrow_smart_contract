@@ -1,6 +1,11 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.19;
 
+interface IEscrowFactory {
+    function updateEscrowAmount(uint256 escrowId, uint256 amount) external;
+    function markEscrowInactive(uint256 escrowId) external;
+}
+
 /**
  * @title Escrow Smart Contract
  * @dev Facilitates transactions between a buyer and a seller with automatic timeout release
@@ -14,6 +19,10 @@ contract Escrow {
     bool public isConfirmed;
     bool public isCancelled;
     bool public isReleased;
+    
+    // Factory contract reference
+    address public factory;
+    uint256 public escrowId;
 
     // Events
     event EscrowInitiated(address buyer, address seller, uint256 amount, uint256 releaseTime);
@@ -47,11 +56,22 @@ contract Escrow {
         require(_seller != address(0), "Invalid seller address");
         require(_timeoutDuration > 0, "Invalid timeout duration");
 
-        buyer = msg.sender;
+        factory = msg.sender;  // Set the factory address
+        buyer = tx.origin;     // Set the original sender as buyer
         seller = _seller;
         releaseTime = block.timestamp + _timeoutDuration;
 
         emit EscrowInitiated(buyer, seller, 0, releaseTime);
+    }
+
+    /**
+     * @dev Sets the escrow ID after creation
+     * @param _escrowId ID assigned by the factory
+     */
+    function setEscrowId(uint256 _escrowId) external {
+        require(msg.sender == factory, "Only factory can set escrow ID");
+        require(escrowId == 0, "Escrow ID already set");
+        escrowId = _escrowId;
     }
 
     /**
@@ -62,6 +82,10 @@ contract Escrow {
         require(amount == 0, "Funds already deposited");
 
         amount = msg.value;
+        
+        // Update amount in factory
+        IEscrowFactory(factory).updateEscrowAmount(escrowId, amount);
+        
         emit FundsDeposited(buyer, msg.value);
     }
 
@@ -95,6 +119,10 @@ contract Escrow {
 
         isCancelled = true;
         payable(buyer).transfer(amount);
+        
+        // Mark as inactive in factory
+        IEscrowFactory(factory).markEscrowInactive(escrowId);
+        
         emit EscrowCancelled(buyer);
     }
 
@@ -115,6 +143,10 @@ contract Escrow {
     function _releaseFunds() private {
         isReleased = true;
         payable(seller).transfer(amount);
+        
+        // Mark as inactive in factory
+        IEscrowFactory(factory).markEscrowInactive(escrowId);
+        
         emit FundsReleased(seller, amount);
     }
 } 

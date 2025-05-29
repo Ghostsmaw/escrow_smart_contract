@@ -5,31 +5,43 @@ async function main() {
   const [deployer] = await ethers.getSigners();
   console.log("Deploying contracts with the account:", deployer.address);
 
-  // Get seller address and timeout from environment variables or use defaults
-  const sellerAddress = process.env.SELLER_ADDRESS;
-  if (!sellerAddress) {
-    throw new Error("Please set SELLER_ADDRESS in your environment variables");
-  }
+  // Deploy the EscrowFactory contract
+  console.log("\nDeploying EscrowFactory...");
+  const EscrowFactory = await hre.ethers.getContractFactory("EscrowFactory");
+  const escrowFactory = await EscrowFactory.deploy();
+  await escrowFactory.waitForDeployment();
+  const factoryAddress = await escrowFactory.getAddress();
 
-  const timeoutDuration = process.env.TIMEOUT_DURATION || 86400; // 24 hours in seconds default
-
-  console.log("Deploying Escrow contract...");
-  console.log("Deployment parameters:");
-  console.log("- Seller address:", sellerAddress);
-  console.log("- Timeout duration:", timeoutDuration, "seconds");
-
-  const Escrow = await hre.ethers.getContractFactory("Escrow");
-  const escrow = await Escrow.deploy(sellerAddress, timeoutDuration);
-
-  await escrow.waitForDeployment();
-  const address = await escrow.getAddress();
-
-  console.log("\nEscrow contract deployed successfully!");
-  console.log("Contract address:", address);
+  console.log("\nDeployment successful!");
+  console.log("EscrowFactory address:", factoryAddress);
   
   // Log deployment verification instructions
   console.log("\nTo verify on Etherscan:");
-  console.log(`npx hardhat verify --network ${hre.network.name} ${address} ${sellerAddress} ${timeoutDuration}`);
+  console.log(`npx hardhat verify --network ${hre.network.name} ${factoryAddress}`);
+
+  // Create an example escrow (optional)
+  if (process.env.CREATE_EXAMPLE_ESCROW === "true") {
+    console.log("\nCreating example escrow...");
+    const exampleSeller = process.env.EXAMPLE_SELLER_ADDRESS;
+    const timeoutDuration = 86400; // 24 hours
+
+    if (exampleSeller) {
+      const tx = await escrowFactory.createEscrow(exampleSeller, timeoutDuration);
+      const receipt = await tx.wait();
+      
+      const event = receipt.logs.find(
+        log => log.fragment && log.fragment.name === 'EscrowCreated'
+      );
+      const escrowId = event.args.escrowId;
+      const escrowAddress = event.args.escrowAddress;
+
+      console.log("Example escrow created:");
+      console.log("- Escrow ID:", escrowId.toString());
+      console.log("- Escrow Address:", escrowAddress);
+      console.log("- Seller Address:", exampleSeller);
+      console.log("- Timeout Duration:", timeoutDuration, "seconds");
+    }
+  }
 }
 
 main()
