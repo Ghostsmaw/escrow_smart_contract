@@ -1,16 +1,15 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.19;
+pragma solidity ^0.8.20;
 
-interface IEscrowFactory {
-    function updateEscrowAmount(uint256 escrowId, uint256 amount) external;
-    function markEscrowInactive(uint256 escrowId) external;
-}
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
 /**
  * @title Escrow Smart Contract
  * @dev Facilitates transactions between a buyer and a seller with automatic timeout release
+ * Supports both ETH and ERC20 tokens
  */
-contract Escrow {
+contract Escrow is ReentrancyGuard {
     // State variables
     address public buyer;
     address public seller;
@@ -20,15 +19,21 @@ contract Escrow {
     bool public isCancelled;
     bool public isReleased;
     
-    // Factory contract reference
-    address public factory;
-    uint256 public escrowId;
+    // Token support
+    IERC20 public token; // Address(0) for ETH, contract address for ERC20
+    bool public isETH;
 
     // Events
-    event EscrowInitiated(address buyer, address seller, uint256 amount, uint256 releaseTime);
-    event FundsDeposited(address buyer, uint256 amount);
+    event EscrowInitiated(
+        address buyer, 
+        address seller, 
+        address token, 
+        uint256 amount, 
+        uint256 releaseTime
+    );
+    event FundsDeposited(address buyer, address token, uint256 amount);
     event DeliveryConfirmed(address buyer);
-    event FundsReleased(address seller, uint256 amount);
+    event FundsReleased(address seller, address token, uint256 amount);
     event EscrowCancelled(address buyer);
 
     // Modifiers
@@ -51,42 +56,56 @@ contract Escrow {
      * @dev Constructor to initialize the escrow
      * @param _seller Address of the seller
      * @param _timeoutDuration Duration in seconds after which funds are automatically released
+     * @param _token Address of ERC20 token (address(0) for ETH)
      */
-    constructor(address _seller, uint256 _timeoutDuration) {
+    constructor(
+        address _seller, 
+        uint256 _timeoutDuration, 
+        address _token
+    ) {
         require(_seller != address(0), "Invalid seller address");
         require(_timeoutDuration > 0, "Invalid timeout duration");
 
-        factory = msg.sender;  // Set the factory address
-        buyer = tx.origin;     // Set the original sender as buyer
+        buyer = msg.sender;
         seller = _seller;
         releaseTime = block.timestamp + _timeoutDuration;
+        
+        if (_token == address(0)) {
+            isETH = true;
+        } else {
+            isETH = false;
+            token = IERC20(_token);
+        }
 
-        emit EscrowInitiated(buyer, seller, 0, releaseTime);
-    }
-
-    /**
-     * @dev Sets the escrow ID after creation
-     * @param _escrowId ID assigned by the factory
-     */
-    function setEscrowId(uint256 _escrowId) external {
-        require(msg.sender == factory, "Only factory can set escrow ID");
-        require(escrowId == 0, "Escrow ID already set");
-        escrowId = _escrowId;
+        emit EscrowInitiated(buyer, seller, _token, 0, releaseTime);
     }
 
     /**
      * @dev Allows buyer to deposit funds into escrow
+     * For ETH: send value with transaction
+     * For ERC20: must approve this contract first, then call with amount
+     * @param _amount Amount of tokens to deposit (ignored for ETH)
      */
-    function deposit() external payable onlyBuyer escrowActive {
-        require(msg.value > 0, "Amount must be greater than 0");
+    function deposit(uint256 _amount) external payable onlyBuyer escrowActive nonReentrant {
         require(amount == 0, "Funds already deposited");
 
-        amount = msg.value;
-        
-        // Update amount in factory
-        IEscrowFactory(factory).updateEscrowAmount(escrowId, amount);
-        
-        emit FundsDeposited(buyer, msg.value);
+        if (isETH) {
+            require(msg.value > 0, "ETH amount must be greater than 0");
+            amount = msg.value;
+            emit FundsDeposited(buyer, address(0), msg.value);
+        } else {
+            require(_amount > 0, "Token amount must be greater than 0");
+            require(msg.value == 0, "Do not send ETH for token deposits");
+            
+            // Transfer tokens from buyer to this contract
+            require(
+                token.transferFrom(msg.sender, address(this), _amount),
+                "Token transfer failed"
+            );
+            
+            amount = _amount;
+            emit FundsDeposited(buyer, address(token), _amount);
+        }
     }
 
     /**
@@ -113,15 +132,17 @@ contract Escrow {
     /**
      * @dev Allows buyer to cancel escrow before timeout
      */
-    function cancelEscrow() external onlyBuyer escrowActive {
+    function cancelEscrow() external onlyBuyer escrowActive nonReentrant {
         require(block.timestamp < releaseTime, "Cannot cancel after timeout");
         require(!isConfirmed, "Cannot cancel after confirmation");
 
         isCancelled = true;
-        payable(buyer).transfer(amount);
         
-        // Mark as inactive in factory
-        IEscrowFactory(factory).markEscrowInactive(escrowId);
+        if (isETH) {
+            payable(buyer).transfer(amount);
+        } else {
+            require(token.transfer(buyer, amount), "Token transfer failed");
+        }
         
         emit EscrowCancelled(buyer);
     }
@@ -138,15 +159,40 @@ contract Escrow {
     }
 
     /**
+     * @dev Returns escrow details
+     */
+    function getEscrowDetails() external view returns (
+        address _buyer,
+        address _seller,
+        address _token,
+        uint256 _amount,
+        uint256 _releaseTime,
+        bool _isETH,
+        string memory _status
+    ) {
+        return (
+            buyer,
+            seller,
+            isETH ? address(0) : address(token),
+            amount,
+            releaseTime,
+            isETH,
+            this.getEscrowStatus()
+        );
+    }
+
+    /**
      * @dev Internal function to release funds to seller
      */
-    function _releaseFunds() private {
+    function _releaseFunds() private nonReentrant {
         isReleased = true;
-        payable(seller).transfer(amount);
         
-        // Mark as inactive in factory
-        IEscrowFactory(factory).markEscrowInactive(escrowId);
-        
-        emit FundsReleased(seller, amount);
+        if (isETH) {
+            payable(seller).transfer(amount);
+            emit FundsReleased(seller, address(0), amount);
+        } else {
+            require(token.transfer(seller, amount), "Token transfer failed");
+            emit FundsReleased(seller, address(token), amount);
+        }
     }
 } 

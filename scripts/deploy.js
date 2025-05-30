@@ -4,49 +4,95 @@ require("dotenv").config();
 async function main() {
   const [deployer] = await ethers.getSigners();
   console.log("Deploying contracts with the account:", deployer.address);
+  console.log("Account balance:", ethers.formatEther(await ethers.provider.getBalance(deployer.address)), "ETH");
 
-  // Deploy the EscrowFactory contract
-  console.log("\nDeploying EscrowFactory...");
-  const EscrowFactory = await hre.ethers.getContractFactory("EscrowFactory");
-  const escrowFactory = await EscrowFactory.deploy();
-  await escrowFactory.waitForDeployment();
-  const factoryAddress = await escrowFactory.getAddress();
+  // Get deployment parameters from environment variables
+  const sellerAddress = process.env.SELLER_ADDRESS;
+  if (!sellerAddress) {
+    throw new Error("Please set SELLER_ADDRESS in your environment variables");
+  }
 
-  console.log("\nDeployment successful!");
-  console.log("EscrowFactory address:", factoryAddress);
+  const timeoutDuration = process.env.TIMEOUT_DURATION || 86400; // 24 hours default
+  const tokenAddress = process.env.TOKEN_ADDRESS || ethers.ZeroAddress; // Default to ETH
+
+  console.log("\n=== Deployment Parameters ===");
+  console.log("- Seller address:", sellerAddress);
+  console.log("- Timeout duration:", timeoutDuration, "seconds");
+  console.log("- Token address:", tokenAddress === ethers.ZeroAddress ? "ETH (Native)" : tokenAddress);
+
+  // Deploy TestToken if we're on a test network and no token specified
+  let deployedTokenAddress = tokenAddress;
+  if (tokenAddress === ethers.ZeroAddress && (hre.network.name === "hardhat" || hre.network.name === "localhost")) {
+    console.log("\n=== Deploying Test Token ===");
+    const TestToken = await hre.ethers.getContractFactory("TestToken");
+    const testToken = await TestToken.deploy();
+    await testToken.waitForDeployment();
+    deployedTokenAddress = await testToken.getAddress();
+    console.log("TestToken deployed to:", deployedTokenAddress);
+    
+    // Mint some tokens to deployer for testing
+    console.log("Minting 1000 tokens to deployer for testing...");
+    await testToken.mint(deployer.address, ethers.parseUnits("1000", 18));
+  }
+
+  // Deploy Escrow contract
+  console.log("\n=== Deploying Escrow Contract ===");
+  const Escrow = await hre.ethers.getContractFactory("Escrow");
+  const escrow = await Escrow.deploy(sellerAddress, timeoutDuration, deployedTokenAddress);
+  await escrow.waitForDeployment();
   
-  // Log deployment verification instructions
-  console.log("\nTo verify on Etherscan:");
-  console.log(`npx hardhat verify --network ${hre.network.name} ${factoryAddress}`);
+  const escrowAddress = await escrow.getAddress();
+  console.log("Escrow contract deployed to:", escrowAddress);
 
-  // Create an example escrow (optional)
-  if (process.env.CREATE_EXAMPLE_ESCROW === "true") {
-    console.log("\nCreating example escrow...");
-    const exampleSeller = process.env.EXAMPLE_SELLER_ADDRESS;
-    const timeoutDuration = 86400; // 24 hours
+  // Display contract details
+  console.log("\n=== Contract Details ===");
+  console.log("- Buyer:", await escrow.buyer());
+  console.log("- Seller:", await escrow.seller());
+  console.log("- Is ETH:", await escrow.isETH());
+  console.log("- Token:", await escrow.isETH() ? "ETH (Native)" : await escrow.token());
+  console.log("- Release Time:", new Date((await escrow.releaseTime()) * 1000n).toLocaleString());
+  console.log("- Status:", await escrow.getEscrowStatus());
 
-    if (exampleSeller) {
-      const tx = await escrowFactory.createEscrow(exampleSeller, timeoutDuration);
-      const receipt = await tx.wait();
-      
-      const event = receipt.logs.find(
-        log => log.fragment && log.fragment.name === 'EscrowCreated'
-      );
-      const escrowId = event.args.escrowId;
-      const escrowAddress = event.args.escrowAddress;
+  // Display usage instructions
+  console.log("\n=== Usage Instructions ===");
+  if (await escrow.isETH()) {
+    console.log("This is an ETH escrow. To deposit:");
+    console.log(`escrow.deposit(0, { value: ethers.parseEther("1.0") })`);
+  } else {
+    console.log("This is a Token escrow. To deposit:");
+    console.log("1. First approve the escrow contract:");
+    console.log(`token.approve("${escrowAddress}", amount)`);
+    console.log("2. Then deposit:");
+    console.log(`escrow.deposit(amount)`);
+  }
 
-      console.log("Example escrow created:");
-      console.log("- Escrow ID:", escrowId.toString());
-      console.log("- Escrow Address:", escrowAddress);
-      console.log("- Seller Address:", exampleSeller);
-      console.log("- Timeout Duration:", timeoutDuration, "seconds");
+  // Verification instructions
+  if (hre.network.name !== "hardhat" && hre.network.name !== "localhost") {
+    console.log("\n=== Verification ===");
+    console.log("To verify on Etherscan:");
+    console.log(`npx hardhat verify --network ${hre.network.name} ${escrowAddress} ${sellerAddress} ${timeoutDuration} ${deployedTokenAddress}`);
+    
+    if (deployedTokenAddress !== tokenAddress) {
+      console.log(`npx hardhat verify --network ${hre.network.name} ${deployedTokenAddress}`);
     }
   }
+
+  return {
+    escrow: escrowAddress,
+    token: deployedTokenAddress,
+    seller: sellerAddress,
+    timeout: timeoutDuration
+  };
 }
 
-main()
-  .then(() => process.exit(0))
-  .catch((error) => {
-    console.error("\nDeployment failed:", error);
-    process.exit(1);
-  }); 
+// Execute deployment
+if (require.main === module) {
+  main()
+    .then(() => process.exit(0))
+    .catch((error) => {
+      console.error("\nDeployment failed:", error);
+      process.exit(1);
+    });
+}
+
+module.exports = main; 
