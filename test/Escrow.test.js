@@ -3,7 +3,7 @@ const { ethers } = require("hardhat");
 const { time } = require("@nomicfoundation/hardhat-network-helpers");
 
 describe("Escrow", function () {
-  let escrow, escrowToken;
+  let escrow, escrowToken, escrowMilestone, escrowTokenMilestone;
   let testToken;
   let buyer, seller, owner, otherAccount;
   const TIMEOUT_DURATION = 86400; // 24 hours in seconds
@@ -36,6 +36,24 @@ describe("Escrow", function () {
       owner.address
     );
     await escrowToken.waitForDeployment();
+
+    // Deploy Milestone ETH Escrow
+    escrowMilestone = await Escrow.connect(buyer).deploy(
+      seller.address, 
+      TIMEOUT_DURATION, 
+      ethers.ZeroAddress,
+      owner.address
+    );
+    await escrowMilestone.waitForDeployment();
+
+    // Deploy Milestone Token Escrow
+    escrowTokenMilestone = await Escrow.connect(buyer).deploy(
+      seller.address, 
+      TIMEOUT_DURATION, 
+      await testToken.getAddress(),
+      owner.address
+    );
+    await escrowTokenMilestone.waitForDeployment();
     
     // Mint tokens to buyer for testing
     await testToken.mint(buyer.address, TOKEN_AMOUNT * 10n); // Mint 1000 tokens
@@ -64,9 +82,375 @@ describe("Escrow", function () {
       expect(await escrow.platformFee()).to.equal(200);
     });
 
+    it("Should start with no milestones", async function () {
+      expect(await escrow.hasMilestones()).to.equal(false);
+      expect(await escrow.completedMilestones()).to.equal(0);
+      expect(await escrow.totalReleasedAmount()).to.equal(0);
+    });
+
     it("Should start with 'Awaiting Deposit' status", async function () {
       expect(await escrow.getEscrowStatus()).to.equal("Awaiting Deposit");
       expect(await escrowToken.getEscrowStatus()).to.equal("Awaiting Deposit");
+    });
+  });
+
+  describe("Milestone Setup", function () {
+    it("Should allow buyer to set up milestones before deposit", async function () {
+      const descriptions = ["Design Phase", "Development Phase", "Testing Phase"];
+      const percentages = [3000, 5000, 2000]; // 30%, 50%, 20%
+
+      await expect(escrowMilestone.connect(buyer).setMilestones(descriptions, percentages))
+        .to.emit(escrowMilestone, "MilestonesSet")
+        .withArgs(3, 10000);
+
+      expect(await escrowMilestone.hasMilestones()).to.equal(true);
+
+      // Check first milestone
+      const milestone0 = await escrowMilestone.getMilestone(0);
+      expect(milestone0.description).to.equal("Design Phase");
+      expect(milestone0.percentage).to.equal(3000);
+      expect(milestone0.isCompleted).to.equal(false);
+      expect(milestone0.isReleased).to.equal(false);
+    });
+
+    it("Should not allow setting milestones after deposit", async function () {
+      await escrowMilestone.connect(buyer).deposit(0, { value: DEPOSIT_AMOUNT });
+
+      const descriptions = ["Phase 1"];
+      const percentages = [10000];
+
+      await expect(
+        escrowMilestone.connect(buyer).setMilestones(descriptions, percentages)
+      ).to.be.revertedWith("Cannot set milestones after deposit");
+    });
+
+    it("Should require total percentage to equal 100%", async function () {
+      const descriptions = ["Phase 1", "Phase 2"];
+      const percentages = [3000, 5000]; // Only 80%
+
+      await expect(
+        escrowMilestone.connect(buyer).setMilestones(descriptions, percentages)
+      ).to.be.revertedWith("Total percentage must equal 100%");
+    });
+
+    it("Should not allow more than MAX_MILESTONES", async function () {
+      const descriptions = new Array(11).fill("Phase");
+      const percentages = new Array(11).fill(909); // 11 milestones
+
+      await expect(
+        escrowMilestone.connect(buyer).setMilestones(descriptions, percentages)
+      ).to.be.revertedWith("Invalid milestone count");
+    });
+
+    it("Should not allow empty descriptions", async function () {
+      const descriptions = ["Phase 1", ""];
+      const percentages = [5000, 5000];
+
+      await expect(
+        escrowMilestone.connect(buyer).setMilestones(descriptions, percentages)
+      ).to.be.revertedWith("Milestone description cannot be empty");
+    });
+
+    it("Should not allow zero percentages", async function () {
+      const descriptions = ["Phase 1", "Phase 2"];
+      const percentages = [5000, 0];
+
+      await expect(
+        escrowMilestone.connect(buyer).setMilestones(descriptions, percentages)
+      ).to.be.revertedWith("Milestone percentage must be greater than 0");
+    });
+
+    it("Should not allow non-buyer to set milestones", async function () {
+      const descriptions = ["Phase 1"];
+      const percentages = [10000];
+
+      await expect(
+        escrowMilestone.connect(seller).setMilestones(descriptions, percentages)
+      ).to.be.revertedWith("Only buyer can call this function");
+    });
+  });
+
+  describe("Milestone Deposits", function () {
+    beforeEach(async function () {
+      // Set up milestones for ETH escrow
+      const descriptions = ["Design", "Development", "Testing"];
+      const percentages = [2500, 5000, 2500]; // 25%, 50%, 25%
+      await escrowMilestone.connect(buyer).setMilestones(descriptions, percentages);
+
+      // Set up milestones for Token escrow
+      await escrowTokenMilestone.connect(buyer).setMilestones(descriptions, percentages);
+    });
+
+    it("Should calculate milestone amounts correctly after ETH deposit", async function () {
+      const depositAmount = ethers.parseEther("1.0");
+      const expectedFee = depositAmount * 200n / 10000n; // 2%
+      const expectedAmount = depositAmount - expectedFee;
+
+      await escrowMilestone.connect(buyer).deposit(0, { value: depositAmount });
+
+      // Check milestone amounts
+      const milestone0 = await escrowMilestone.getMilestone(0);
+      const milestone1 = await escrowMilestone.getMilestone(1);
+      const milestone2 = await escrowMilestone.getMilestone(2);
+
+      const expectedAmount0 = expectedAmount * 2500n / 10000n; // 25%
+      const expectedAmount1 = expectedAmount * 5000n / 10000n; // 50%
+      const expectedAmount2 = expectedAmount * 2500n / 10000n; // 25%
+
+      expect(milestone0.amount).to.equal(expectedAmount0);
+      expect(milestone1.amount).to.equal(expectedAmount1);
+      expect(milestone2.amount).to.equal(expectedAmount2);
+    });
+
+    it("Should calculate milestone amounts correctly after token deposit", async function () {
+      const depositAmount = TOKEN_AMOUNT;
+      const expectedFee = depositAmount * 200n / 10000n; // 2%
+      const expectedAmount = depositAmount - expectedFee;
+
+      await testToken.connect(buyer).approve(await escrowTokenMilestone.getAddress(), depositAmount);
+      await escrowTokenMilestone.connect(buyer).deposit(depositAmount);
+
+      // Check milestone amounts
+      const milestone0 = await escrowTokenMilestone.getMilestone(0);
+      const milestone1 = await escrowTokenMilestone.getMilestone(1);
+      const milestone2 = await escrowTokenMilestone.getMilestone(2);
+
+      const expectedAmount0 = expectedAmount * 2500n / 10000n; // 25%
+      const expectedAmount1 = expectedAmount * 5000n / 10000n; // 50%
+      const expectedAmount2 = expectedAmount * 2500n / 10000n; // 25%
+
+      expect(milestone0.amount).to.equal(expectedAmount0);
+      expect(milestone1.amount).to.equal(expectedAmount1);
+      expect(milestone2.amount).to.equal(expectedAmount2);
+    });
+  });
+
+  describe("Milestone Completion", function () {
+    beforeEach(async function () {
+      // Set up milestones
+      const descriptions = ["Design", "Development", "Testing"];
+      const percentages = [2500, 5000, 2500]; // 25%, 50%, 25%
+      await escrowMilestone.connect(buyer).setMilestones(descriptions, percentages);
+      
+      // Make deposit
+      await escrowMilestone.connect(buyer).deposit(0, { value: DEPOSIT_AMOUNT });
+    });
+
+    it("Should allow buyer to confirm milestones in order", async function () {
+      // Confirm first milestone
+      await expect(escrowMilestone.connect(buyer).confirmMilestone(0))
+        .to.emit(escrowMilestone, "MilestoneCompleted")
+        .withArgs(0, "Design", await (await escrowMilestone.getMilestone(0)).amount);
+
+      expect(await escrowMilestone.completedMilestones()).to.equal(1);
+
+      // Confirm second milestone
+      await escrowMilestone.connect(buyer).confirmMilestone(1);
+      expect(await escrowMilestone.completedMilestones()).to.equal(2);
+
+      // Confirm third milestone
+      await expect(escrowMilestone.connect(buyer).confirmMilestone(2))
+        .to.emit(escrowMilestone, "AllMilestonesCompleted");
+
+      expect(await escrowMilestone.completedMilestones()).to.equal(3);
+      expect(await escrowMilestone.isConfirmed()).to.equal(true);
+    });
+
+    it("Should not allow confirming milestones out of order", async function () {
+      // Try to confirm second milestone first
+      await expect(
+        escrowMilestone.connect(buyer).confirmMilestone(1)
+      ).to.be.revertedWith("Previous milestone not completed");
+    });
+
+    it("Should not allow non-buyer to confirm milestones", async function () {
+      await expect(
+        escrowMilestone.connect(seller).confirmMilestone(0)
+      ).to.be.revertedWith("Only buyer can call this function");
+    });
+
+    it("Should not allow confirming already completed milestones", async function () {
+      await escrowMilestone.connect(buyer).confirmMilestone(0);
+      
+      await expect(
+        escrowMilestone.connect(buyer).confirmMilestone(0)
+      ).to.be.revertedWith("Milestone already completed");
+    });
+
+    it("Should not allow confirming milestones for non-milestone escrow", async function () {
+      await expect(
+        escrow.connect(buyer).confirmMilestone(0)
+      ).to.be.revertedWith("Milestone does not exist");
+    });
+
+    it("Should update status correctly with milestone progress", async function () {
+      expect(await escrowMilestone.getEscrowStatus()).to.equal("Pending (0/3 milestones)");
+      
+      await escrowMilestone.connect(buyer).confirmMilestone(0);
+      expect(await escrowMilestone.getEscrowStatus()).to.equal("Pending (1/3 milestones)");
+      
+      await escrowMilestone.connect(buyer).confirmMilestone(1);
+      expect(await escrowMilestone.getEscrowStatus()).to.equal("Pending (2/3 milestones)");
+      
+      await escrowMilestone.connect(buyer).confirmMilestone(2);
+      expect(await escrowMilestone.getEscrowStatus()).to.equal("Confirmed");
+    });
+  });
+
+  describe("Milestone Fund Release", function () {
+    beforeEach(async function () {
+      // Set up milestones
+      const descriptions = ["Design", "Development", "Testing"];
+      const percentages = [2500, 5000, 2500]; // 25%, 50%, 25%
+      await escrowMilestone.connect(buyer).setMilestones(descriptions, percentages);
+      
+      // Make deposit and confirm first milestone
+      await escrowMilestone.connect(buyer).deposit(0, { value: DEPOSIT_AMOUNT });
+      await escrowMilestone.connect(buyer).confirmMilestone(0);
+    });
+
+    it("Should allow seller to release funds for completed milestone", async function () {
+      const sellerBalanceBefore = await ethers.provider.getBalance(seller.address);
+      const milestone0 = await escrowMilestone.getMilestone(0);
+
+      await expect(escrowMilestone.connect(seller).releaseMilestoneFunds(0))
+        .to.emit(escrowMilestone, "MilestoneReleased")
+        .withArgs(0, seller.address, milestone0.amount);
+
+      const sellerBalanceAfter = await ethers.provider.getBalance(seller.address);
+      expect(sellerBalanceAfter - sellerBalanceBefore).to.be.greaterThan(
+        milestone0.amount - ethers.parseEther("0.01") // Account for gas
+      );
+
+      expect(await escrowMilestone.totalReleasedAmount()).to.equal(milestone0.amount);
+
+      // Check milestone is marked as released
+      const updatedMilestone = await escrowMilestone.getMilestone(0);
+      expect(updatedMilestone.isReleased).to.equal(true);
+    });
+
+    it("Should not allow releasing funds for uncompleted milestone", async function () {
+      await expect(
+        escrowMilestone.connect(seller).releaseMilestoneFunds(1)
+      ).to.be.revertedWith("Milestone not completed");
+    });
+
+    it("Should not allow releasing already released milestone funds", async function () {
+      await escrowMilestone.connect(seller).releaseMilestoneFunds(0);
+      
+      await expect(
+        escrowMilestone.connect(seller).releaseMilestoneFunds(0)
+      ).to.be.revertedWith("Milestone funds already released");
+    });
+
+    it("Should not allow non-seller to release milestone funds", async function () {
+      await expect(
+        escrowMilestone.connect(buyer).releaseMilestoneFunds(0)
+      ).to.be.revertedWith("Only seller can call this function");
+    });
+
+    it("Should mark escrow as released when all milestones are released", async function () {
+      // Complete and release all milestones
+      await escrowMilestone.connect(seller).releaseMilestoneFunds(0);
+      
+      await escrowMilestone.connect(buyer).confirmMilestone(1);
+      await escrowMilestone.connect(seller).releaseMilestoneFunds(1);
+      
+      await escrowMilestone.connect(buyer).confirmMilestone(2);
+      
+      await expect(escrowMilestone.connect(seller).releaseMilestoneFunds(2))
+        .to.emit(escrowMilestone, "FundsReleased");
+
+      expect(await escrowMilestone.isReleased()).to.equal(true);
+      expect(await escrowMilestone.getEscrowStatus()).to.equal("Released");
+    });
+  });
+
+  describe("Milestone Cancellation", function () {
+    beforeEach(async function () {
+      // Set up milestones
+      const descriptions = ["Design", "Development", "Testing"];
+      const percentages = [2500, 5000, 2500]; // 25%, 50%, 25%
+      await escrowMilestone.connect(buyer).setMilestones(descriptions, percentages);
+      
+      // Make deposit
+      await escrowMilestone.connect(buyer).deposit(0, { value: DEPOSIT_AMOUNT });
+    });
+
+    it("Should refund only unreleased milestone amounts on cancellation", async function () {
+      // Complete and release first milestone
+      await escrowMilestone.connect(buyer).confirmMilestone(0);
+      await escrowMilestone.connect(seller).releaseMilestoneFunds(0);
+
+      const buyerBalanceBefore = await ethers.provider.getBalance(buyer.address);
+      const totalAmount = await escrowMilestone.amount();
+      const releasedAmount = await escrowMilestone.totalReleasedAmount();
+      const expectedRefund = totalAmount - releasedAmount;
+
+      await escrowMilestone.connect(buyer).cancelEscrow();
+
+      const buyerBalanceAfter = await ethers.provider.getBalance(buyer.address);
+      expect(buyerBalanceAfter - buyerBalanceBefore).to.be.greaterThan(
+        expectedRefund - ethers.parseEther("0.01") // Account for gas
+      );
+
+      expect(await escrowMilestone.getEscrowStatus()).to.equal("Cancelled");
+    });
+  });
+
+  describe("Non-Milestone Functionality", function () {
+    it("Should prevent using milestone functions on non-milestone escrow", async function () {
+      await escrow.connect(buyer).deposit(0, { value: DEPOSIT_AMOUNT });
+
+      await expect(
+        escrow.connect(buyer).confirmMilestone(0)
+      ).to.be.revertedWith("Milestone does not exist");
+
+      await expect(
+        escrow.connect(seller).releaseMilestoneFunds(0)
+      ).to.be.revertedWith("Milestone does not exist");
+    });
+
+    it("Should prevent using regular functions on milestone escrow", async function () {
+      const descriptions = ["Phase 1"];
+      const percentages = [10000];
+      await escrowMilestone.connect(buyer).setMilestones(descriptions, percentages);
+      await escrowMilestone.connect(buyer).deposit(0, { value: DEPOSIT_AMOUNT });
+
+      await expect(
+        escrowMilestone.connect(buyer).confirmDelivery()
+      ).to.be.revertedWith("Use confirmMilestone for milestone-based escrows");
+
+      await expect(
+        escrowMilestone.connect(seller).releaseFunds()
+      ).to.be.revertedWith("Use releaseMilestoneFunds for milestone-based escrows");
+    });
+  });
+
+  describe("Enhanced Escrow Details", function () {
+    it("Should return enhanced details including milestone information", async function () {
+      const descriptions = ["Design", "Development"];
+      const percentages = [4000, 6000]; // 40%, 60%
+      await escrowMilestone.connect(buyer).setMilestones(descriptions, percentages);
+      await escrowMilestone.connect(buyer).deposit(0, { value: DEPOSIT_AMOUNT });
+      
+      const details = await escrowMilestone.getEscrowDetails();
+      
+      expect(details[9]).to.equal(true); // hasMilestones
+      expect(details[10]).to.equal(2); // milestoneCount
+      expect(details[11]).to.equal(0); // completedMilestones
+      expect(details[12]).to.equal(0); // totalReleasedAmount
+    });
+
+    it("Should allow getting all milestones", async function () {
+      const descriptions = ["Design", "Development"];
+      const percentages = [4000, 6000]; // 40%, 60%
+      await escrowMilestone.connect(buyer).setMilestones(descriptions, percentages);
+      
+      const allMilestones = await escrowMilestone.getAllMilestones();
+      expect(allMilestones.length).to.equal(2);
+      expect(allMilestones[0].description).to.equal("Design");
+      expect(allMilestones[1].description).to.equal("Development");
     });
   });
 

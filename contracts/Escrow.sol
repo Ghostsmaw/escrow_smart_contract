@@ -8,7 +8,7 @@ import "@openzeppelin/contracts/access/Ownable.sol";
 /**
  * @title Escrow Smart Contract
  * @dev Facilitates transactions between a buyer and a seller with automatic timeout release
- * Supports both ETH and ERC20 tokens with fee collection mechanism
+ * Supports both ETH and ERC20 tokens with fee collection mechanism and milestone-based releases
  */
 contract Escrow is ReentrancyGuard, Ownable {
     // State variables
@@ -39,6 +39,23 @@ contract Escrow is ReentrancyGuard, Ownable {
     
     FeeConfig public feeConfig;
 
+    // Milestone system
+    struct Milestone {
+        string description; // Description of what needs to be completed
+        uint256 percentage; // Percentage of total amount (in basis points)
+        bool isCompleted; // Whether buyer has confirmed this milestone
+        bool isReleased; // Whether funds for this milestone have been released
+        uint256 amount; // Actual amount for this milestone (calculated from percentage)
+    }
+    
+    Milestone[] public milestones;
+    bool public hasMilestones; // Whether this escrow uses milestones
+    uint256 public totalReleasedAmount; // Total amount released across all milestones
+    uint256 public completedMilestones; // Number of completed milestones
+    
+    // Constants for milestone system
+    uint256 public constant MAX_MILESTONES = 10; // Maximum number of milestones
+
     // Events
     event EscrowInitiated(
         address buyer, 
@@ -46,7 +63,8 @@ contract Escrow is ReentrancyGuard, Ownable {
         address token, 
         uint256 amount, 
         uint256 releaseTime,
-        uint256 platformFee
+        uint256 platformFee,
+        bool hasMilestones
     );
     event FundsDeposited(address buyer, address token, uint256 amount, uint256 fee);
     event DeliveryConfirmed(address buyer);
@@ -54,6 +72,12 @@ contract Escrow is ReentrancyGuard, Ownable {
     event EscrowCancelled(address buyer);
     event FeesCollected(address owner, address token, uint256 amount);
     event FeeConfigUpdated(uint256 baseFee, uint256 minimumFee, bool isActive);
+    
+    // Milestone events
+    event MilestonesSet(uint256 milestoneCount, uint256 totalPercentage);
+    event MilestoneCompleted(uint256 indexed milestoneIndex, string description, uint256 amount);
+    event MilestoneReleased(uint256 indexed milestoneIndex, address seller, uint256 amount);
+    event AllMilestonesCompleted();
 
     // Modifiers
     modifier onlyBuyer() {
@@ -68,6 +92,11 @@ contract Escrow is ReentrancyGuard, Ownable {
 
     modifier escrowActive() {
         require(!isReleased && !isCancelled, "Escrow is not active");
+        _;
+    }
+
+    modifier milestoneExists(uint256 _milestoneIndex) {
+        require(_milestoneIndex < milestones.length, "Milestone does not exist");
         _;
     }
 
@@ -107,7 +136,47 @@ contract Escrow is ReentrancyGuard, Ownable {
 
         platformFee = feeConfig.baseFee;
 
-        emit EscrowInitiated(buyer, seller, _token, 0, releaseTime, platformFee);
+        emit EscrowInitiated(buyer, seller, _token, 0, releaseTime, platformFee, false);
+    }
+
+    /**
+     * @dev Set up milestones for progressive release (can only be called before deposit)
+     * @param _descriptions Array of milestone descriptions
+     * @param _percentages Array of milestone percentages (in basis points)
+     */
+    function setMilestones(
+        string[] calldata _descriptions,
+        uint256[] calldata _percentages
+    ) external onlyBuyer escrowActive {
+        require(amount == 0, "Cannot set milestones after deposit");
+        require(_descriptions.length == _percentages.length, "Arrays length mismatch");
+        require(_descriptions.length > 0 && _descriptions.length <= MAX_MILESTONES, "Invalid milestone count");
+        require(!hasMilestones, "Milestones already set");
+        
+        uint256 totalPercentage = 0;
+        
+        // Clear any existing milestones
+        delete milestones;
+        
+        for (uint256 i = 0; i < _descriptions.length; i++) {
+            require(_percentages[i] > 0, "Milestone percentage must be greater than 0");
+            require(bytes(_descriptions[i]).length > 0, "Milestone description cannot be empty");
+            
+            milestones.push(Milestone({
+                description: _descriptions[i],
+                percentage: _percentages[i],
+                isCompleted: false,
+                isReleased: false,
+                amount: 0 // Will be calculated after deposit
+            }));
+            
+            totalPercentage += _percentages[i];
+        }
+        
+        require(totalPercentage == FEE_DENOMINATOR, "Total percentage must equal 100%");
+        
+        hasMilestones = true;
+        emit MilestonesSet(milestones.length, totalPercentage);
     }
 
     /**
@@ -170,13 +239,90 @@ contract Escrow is ReentrancyGuard, Ownable {
             
             emit FundsDeposited(buyer, address(token), amount, feeAmount);
         }
+
+        // Calculate milestone amounts if milestones are set
+        if (hasMilestones) {
+            for (uint256 i = 0; i < milestones.length; i++) {
+                milestones[i].amount = (amount * milestones[i].percentage) / FEE_DENOMINATOR;
+            }
+        }
     }
 
     /**
-     * @dev Allows buyer to confirm delivery
+     * @dev Allows buyer to confirm completion of a specific milestone
+     * @param _milestoneIndex Index of the milestone to confirm
+     */
+    function confirmMilestone(uint256 _milestoneIndex) 
+        external 
+        onlyBuyer 
+        escrowActive 
+        milestoneExists(_milestoneIndex) 
+    {
+        require(amount > 0, "No funds in escrow");
+        require(hasMilestones, "This escrow does not use milestones");
+        require(!milestones[_milestoneIndex].isCompleted, "Milestone already completed");
+        
+        // Ensure milestones are completed in order
+        if (_milestoneIndex > 0) {
+            require(milestones[_milestoneIndex - 1].isCompleted, "Previous milestone not completed");
+        }
+        
+        milestones[_milestoneIndex].isCompleted = true;
+        completedMilestones++;
+        
+        emit MilestoneCompleted(
+            _milestoneIndex, 
+            milestones[_milestoneIndex].description, 
+            milestones[_milestoneIndex].amount
+        );
+        
+        // Check if all milestones are completed
+        if (completedMilestones == milestones.length) {
+            isConfirmed = true;
+            emit AllMilestonesCompleted();
+        }
+    }
+
+    /**
+     * @dev Allows seller to release funds for a completed milestone
+     * @param _milestoneIndex Index of the milestone to release funds for
+     */
+    function releaseMilestoneFunds(uint256 _milestoneIndex) 
+        external 
+        onlySeller 
+        escrowActive 
+        milestoneExists(_milestoneIndex) 
+        nonReentrant 
+    {
+        require(hasMilestones, "This escrow does not use milestones");
+        require(milestones[_milestoneIndex].isCompleted, "Milestone not completed");
+        require(!milestones[_milestoneIndex].isReleased, "Milestone funds already released");
+        
+        milestones[_milestoneIndex].isReleased = true;
+        uint256 releaseAmount = milestones[_milestoneIndex].amount;
+        totalReleasedAmount += releaseAmount;
+        
+        if (isETH) {
+            payable(seller).transfer(releaseAmount);
+        } else {
+            require(token.transfer(seller, releaseAmount), "Token transfer failed");
+        }
+        
+        emit MilestoneReleased(_milestoneIndex, seller, releaseAmount);
+        
+        // Check if all milestone funds have been released
+        if (totalReleasedAmount == amount) {
+            isReleased = true;
+            emit FundsReleased(seller, isETH ? address(0) : address(token), amount, collectedFees);
+        }
+    }
+
+    /**
+     * @dev Allows buyer to confirm delivery (for non-milestone escrows)
      */
     function confirmDelivery() external onlyBuyer escrowActive {
         require(amount > 0, "No funds in escrow");
+        require(!hasMilestones, "Use confirmMilestone for milestone-based escrows");
         
         isConfirmed = true;
         emit DeliveryConfirmed(buyer);
@@ -184,10 +330,11 @@ contract Escrow is ReentrancyGuard, Ownable {
     }
 
     /**
-     * @dev Allows seller to withdraw funds after timeout or confirmation
+     * @dev Allows seller to withdraw funds after timeout or confirmation (for non-milestone escrows)
      */
     function releaseFunds() external onlySeller escrowActive {
         require(amount > 0, "No funds in escrow");
+        require(!hasMilestones, "Use releaseMilestoneFunds for milestone-based escrows");
         require(isConfirmed || block.timestamp >= releaseTime, "Cannot release funds yet");
 
         _releaseFunds();
@@ -195,7 +342,7 @@ contract Escrow is ReentrancyGuard, Ownable {
 
     /**
      * @dev Allows buyer to cancel escrow before timeout
-     * Note: Fees are not refunded on cancellation
+     * Note: Fees are not refunded on cancellation, and only unreleased milestone funds are returned
      */
     function cancelEscrow() external onlyBuyer escrowActive nonReentrant {
         require(block.timestamp < releaseTime, "Cannot cancel after timeout");
@@ -203,10 +350,20 @@ contract Escrow is ReentrancyGuard, Ownable {
 
         isCancelled = true;
         
-        if (isETH) {
-            payable(buyer).transfer(amount);
+        uint256 refundAmount;
+        if (hasMilestones) {
+            // Only refund unreleased milestone amounts
+            refundAmount = amount - totalReleasedAmount;
         } else {
-            require(token.transfer(buyer, amount), "Token transfer failed");
+            refundAmount = amount;
+        }
+        
+        if (refundAmount > 0) {
+            if (isETH) {
+                payable(buyer).transfer(refundAmount);
+            } else {
+                require(token.transfer(buyer, refundAmount), "Token transfer failed");
+            }
         }
         
         emit EscrowCancelled(buyer);
@@ -263,12 +420,18 @@ contract Escrow is ReentrancyGuard, Ownable {
         if (isReleased) return "Released";
         if (isCancelled) return "Cancelled";
         if (isConfirmed) return "Confirmed";
-        if (amount > 0) return "Pending";
+        if (amount > 0) {
+            if (hasMilestones) {
+                return string(abi.encodePacked("Pending (", 
+                    _toString(completedMilestones), "/", _toString(milestones.length), " milestones)"));
+            }
+            return "Pending";
+        }
         return "Awaiting Deposit";
     }
 
     /**
-     * @dev Returns escrow details including fee information
+     * @dev Returns escrow details including fee and milestone information
      */
     function getEscrowDetails() external view returns (
         address _buyer,
@@ -279,7 +442,11 @@ contract Escrow is ReentrancyGuard, Ownable {
         bool _isETH,
         string memory _status,
         uint256 _platformFee,
-        uint256 _collectedFees
+        uint256 _collectedFees,
+        bool _hasMilestones,
+        uint256 _milestoneCount,
+        uint256 _completedMilestones,
+        uint256 _totalReleasedAmount
     ) {
         return (
             buyer,
@@ -290,8 +457,45 @@ contract Escrow is ReentrancyGuard, Ownable {
             isETH,
             this.getEscrowStatus(),
             platformFee,
-            collectedFees
+            collectedFees,
+            hasMilestones,
+            milestones.length,
+            completedMilestones,
+            totalReleasedAmount
         );
+    }
+
+    /**
+     * @dev Get milestone details
+     * @param _milestoneIndex Index of the milestone
+     */
+    function getMilestone(uint256 _milestoneIndex) 
+        external 
+        view 
+        milestoneExists(_milestoneIndex) 
+        returns (
+            string memory description,
+            uint256 percentage,
+            bool isCompleted,
+            bool isReleased,
+            uint256 amount
+        ) 
+    {
+        Milestone storage milestone = milestones[_milestoneIndex];
+        return (
+            milestone.description,
+            milestone.percentage,
+            milestone.isCompleted,
+            milestone.isReleased,
+            milestone.amount
+        );
+    }
+
+    /**
+     * @dev Get all milestones
+     */
+    function getAllMilestones() external view returns (Milestone[] memory) {
+        return milestones;
     }
 
     /**
@@ -302,7 +506,7 @@ contract Escrow is ReentrancyGuard, Ownable {
     }
 
     /**
-     * @dev Internal function to release funds to seller
+     * @dev Internal function to release funds to seller (for non-milestone escrows)
      */
     function _releaseFunds() private nonReentrant {
         isReleased = true;
@@ -314,5 +518,27 @@ contract Escrow is ReentrancyGuard, Ownable {
             require(token.transfer(seller, amount), "Token transfer failed");
             emit FundsReleased(seller, address(token), amount, collectedFees);
         }
+    }
+
+    /**
+     * @dev Convert uint to string
+     */
+    function _toString(uint256 value) internal pure returns (string memory) {
+        if (value == 0) {
+            return "0";
+        }
+        uint256 temp = value;
+        uint256 digits;
+        while (temp != 0) {
+            digits++;
+            temp /= 10;
+        }
+        bytes memory buffer = new bytes(digits);
+        while (value != 0) {
+            digits -= 1;
+            buffer[digits] = bytes1(uint8(48 + uint256(value % 10)));
+            value /= 10;
+        }
+        return string(buffer);
     }
 } 
